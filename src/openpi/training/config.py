@@ -374,6 +374,7 @@ class LeRobotCalvinDataConfig(DataConfigFactory):
                         "observation/wrist_image": "observation.images.wrist",
                         "observation/state": "observation.state",
                         "actions": "action",
+                        "prompt": "prompt",
                     }
                 )
             ]
@@ -966,12 +967,21 @@ _CONFIGS = [
             action_horizon=10,
         ),
         data=LeRobotCalvinDataConfig(
-            repo_id="/data/fywang/Calvin/calvin_debug_dataset/lerobot_v2_dataset",
+            # repo_id="/data/fywang/Calvin/calvin_debug_dataset/lerobot_v2_dataset",
+            repo_id="/data/fywang/Calvin/task_ABCD_D/lerobot_v2_dataset",
             prompt_from_task=True,
+            assets=AssetsConfig(
+                assets_dir="./assets",
+                asset_id="calvin/task_ABCD_D",
+            ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/model/fywang/pi05_base/params"),
-        num_train_steps=10_000,
-        batch_size=7,
+        num_train_steps=200_000,
+        checkpoint_base_dir="/output/checkpoints/",
+        num_workers=8,
+        batch_size=35,
+        save_interval=5000,
+        keep_period=10000,
     ),
     TrainConfig(
         name="pi0_calvin",
