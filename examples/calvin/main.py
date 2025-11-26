@@ -179,7 +179,7 @@ class Args:
     ep_len: int = 360  # Max steps per subtask (CALVIN default)
 
     # Output options
-    eval_log_dir: str = "data/calvin/eval_logs"
+    eval_log_dir: str = "/output/logs/calvin/eval/"
     debug: bool = False
 
     seed: int = 42

@@ -977,11 +977,12 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/model/fywang/pi05_base/params"),
         num_train_steps=200_000,
-        checkpoint_base_dir="/output/checkpoints/",
+        checkpoint_base_dir="/data/fywang/pi-calvin/checkpoints/",
         num_workers=8,
-        batch_size=35,
+        batch_size=32,
         save_interval=5000,
         keep_period=10000,
+        wandb_enabled=False,
     ),
     TrainConfig(
         name="pi0_calvin",
@@ -989,13 +990,21 @@ _CONFIGS = [
             action_horizon=10,
         ),
         data=LeRobotCalvinDataConfig(
-            repo_id="calvin_debug_dataset/lerobot_v2_dataset",
+            repo_id="/data/fywang/Calvin/task_ABCD_D/lerobot_v2_dataset",
             prompt_from_task=True,
+            assets=AssetsConfig(
+                assets_dir="./assets",
+                asset_id="calvin/task_ABCD_D",
+            ),
         ),
         # Update this path if you have a local pi0_base; otherwise it will attempt to download from GCS.
         weight_loader=weight_loaders.CheckpointWeightLoader("/model/fywang/pi0_base/params"),
-        num_train_steps=10_000,
-        batch_size=8,
+        num_train_steps=100_000,
+        checkpoint_base_dir="/data/fywang/pi-calvin/checkpoints/",
+        num_workers=2,
+        batch_size=32,
+        save_interval=5000,
+        keep_period=10000,
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
