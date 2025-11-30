@@ -46,12 +46,16 @@ class CheckpointWeightLoader(WeightLoader):
     """
 
     params_path: str
+    # Additional keys to fill from initialized model (for new architecture components)
+    missing_keys: tuple[str, ...] = ()
 
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        # Add all missing LoRA weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+        # Build regex: always include lora, plus any additional missing_keys
+        patterns = [".*lora.*"] + [f".*{k}.*" for k in self.missing_keys]
+        missing_regex = "|".join(patterns)
+        return _merge_params(loaded_params, params, missing_regex=missing_regex)
 
 
 @dataclasses.dataclass(frozen=True)

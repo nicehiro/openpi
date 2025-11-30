@@ -113,16 +113,27 @@ class ModelTransformFactory(GroupFactory):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
             case _model.ModelType.PI0:
-                return _transforms.Group(
-                    inputs=[
-                        _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
-                        _transforms.TokenizePrompt(
-                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
-                        ),
-                        _transforms.PadStatesAndActions(model_config.action_dim),
-                    ],
-                )
+                transforms_list = [
+                    _transforms.InjectDefaultPrompt(self.default_prompt),
+                    _transforms.ResizeImages(224, 224),
+                ]
+
+                # NEW: Add state history transform if enabled
+                if hasattr(model_config, "use_state_history") and model_config.use_state_history:
+                    transforms_list.append(
+                        _transforms.StateHistoryTransform(
+                            history_len=model_config.state_history_len
+                        )
+                    )
+
+                transforms_list.extend([
+                    _transforms.TokenizePrompt(
+                        _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                    ),
+                    _transforms.PadStatesAndActions(model_config.action_dim),
+                ])
+
+                return _transforms.Group(inputs=transforms_list)
             case _model.ModelType.PI05:
                 assert isinstance(model_config, pi0_config.Pi0Config)
                 return _transforms.Group(
@@ -1005,6 +1016,7 @@ _CONFIGS = [
         batch_size=32,
         save_interval=5000,
         keep_period=10000,
+        wandb_enabled=False,
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
@@ -1053,6 +1065,45 @@ _CONFIGS = [
         num_train_steps=10,
         overwrite=True,
         exp_name="debug_pi05",
+        wandb_enabled=False,
+    ),
+    #
+    # State history configs
+    #
+    TrainConfig(
+        name="pi0_libero_state_history",
+        model=pi0_config.Pi0Config(
+            use_state_history=True,
+            state_history_len=8,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi0_calvin_state_history",
+        model=pi0_config.Pi0Config(
+            use_state_history=True,
+            state_history_len=8,
+            action_horizon=10,
+        ),
+        data=LeRobotCalvinDataConfig(
+            repo_id="/data/fywang/Calvin/task_ABCD_D/lerobot_v2_dataset",
+            prompt_from_task=True,
+            assets=AssetsConfig(
+                assets_dir="./assets",
+                asset_id="calvin/task_ABCD_D",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/model/fywang/pi0_base/params",
+            missing_keys=("state_history_proj",),
+        ),
+        num_train_steps=100_000,
         wandb_enabled=False,
     ),
     #

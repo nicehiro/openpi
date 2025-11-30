@@ -99,12 +99,17 @@ def main(config_name: str, max_frames: int | None = None):
             data_config, config.model.action_horizon, config.batch_size, config.model, config.num_workers, max_frames
         )
 
-    keys = ["state", "actions"]
+    # NEW: Include state_history in normalization if enabled
+    if hasattr(config.model, "use_state_history") and config.model.use_state_history:
+        keys = ["state", "state_history", "actions"]
+    else:
+        keys = ["state", "actions"]
     stats = {key: normalize.RunningStats() for key in keys}
 
     for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
         for key in keys:
-            stats[key].update(np.asarray(batch[key]))
+            if key in batch:
+                stats[key].update(np.asarray(batch[key]))
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 

@@ -138,11 +138,22 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+
+    # Build delta_timestamps dict for action sequences
+    delta_timestamps = {
+        key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+    }
+
+    # Add state history if enabled
+    if hasattr(model_config, 'use_state_history') and model_config.use_state_history:
+        history_len = model_config.state_history_len
+        delta_timestamps["observation.state"] = [
+            -(history_len - 1 - t) / dataset_meta.fps for t in range(history_len)
+        ]
+
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
+        delta_timestamps=delta_timestamps,
     )
 
     if data_config.prompt_from_task:

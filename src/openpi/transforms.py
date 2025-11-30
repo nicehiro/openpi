@@ -332,8 +332,34 @@ class PadStatesAndActions(DataTransformFn):
 
     def __call__(self, data: DataDict) -> DataDict:
         data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis=-1)
+        if "state_history" in data:
+            data["state_history"] = pad_to_dim(data["state_history"], self.model_action_dim, axis=-1)
         if "actions" in data:
             data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis=-1)
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class StateHistoryTransform(DataTransformFn):
+    """Extracts and stacks state history."""
+
+    history_len: int = 8
+
+    def __call__(self, data: DataDict) -> DataDict:
+        # Input: data["state"] is [history_len, state_dim] from LeRobot delta_timestamps
+        # Or single state [state_dim] during inference
+        state = data.get("state")
+
+        if state.ndim == 1:
+            # Single state, expand to history (inference case)
+            state = np.tile(state[None, :], (self.history_len, 1))
+        elif state.shape[0] < self.history_len:
+            # Pad with first state (episode boundary case)
+            padding = np.tile(state[0:1], (self.history_len - state.shape[0], 1))
+            state = np.concatenate([padding, state], axis=0)
+
+        data["state_history"] = state  # Shape: [history_len, state_dim]
+        data["state"] = state[-1]  # Keep current state for compatibility
         return data
 
 

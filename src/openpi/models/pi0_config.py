@@ -32,11 +32,17 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # State history configuration
+    use_state_history: bool = False  # Enable state history feature
+    state_history_len: int = 8  # Number of timesteps in history
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
+        if self.use_state_history and self.pi05:
+            raise ValueError("State history not compatible with pi05")
 
     @property
     @override

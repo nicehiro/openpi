@@ -67,6 +67,8 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.use_state_history = config.use_state_history
+        self.state_history_len = config.state_history_len
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -94,7 +96,12 @@ class Pi0(_model.BaseModel):
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         else:
-            self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
+            if config.use_state_history:
+                # NEW: Project each history timestep separately
+                self.state_history_proj = nnx.Linear(config.action_dim, paligemma_config.width, rngs=rngs)
+            else:
+                # Keep single state projection for backward compatibility
+                self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
@@ -131,6 +138,20 @@ class Pi0(_model.BaseModel):
             input_mask.append(obs.tokenized_prompt_mask)
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
+
+        # NEW: Add state history tokens to prefix
+        if self.use_state_history and obs.state_history is not None:
+            # obs.state_history shape: [b, history_len, state_dim]
+            b, h, d = obs.state_history.shape
+            state_flat = obs.state_history.reshape(b * h, d)
+            state_tokens_flat = self.state_history_proj(state_flat)
+            state_tokens = state_tokens_flat.reshape(b, h, -1)
+
+            tokens.append(state_tokens)
+            input_mask.append(jnp.ones((b, h), dtype=jnp.bool_))
+            # Bidirectional attention within prefix
+            ar_mask += [False] * h
+
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
@@ -148,13 +169,14 @@ class Pi0(_model.BaseModel):
         input_mask = []
         ar_mask = []
         tokens = []
-        if not self.pi05:
-            # add a single state token
+        if not self.pi05 and not self.use_state_history:
+            # OLD behavior: add single state token to suffix
             state_token = self.state_proj(obs.state)[:, None, :]
             tokens.append(state_token)
             input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
             # image/language inputs do not attend to state or actions
             ar_mask += [True]
+        # ELSE: State is in prefix (use_state_history=True), don't add to suffix
 
         action_tokens = self.action_in_proj(noisy_actions)
         # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
