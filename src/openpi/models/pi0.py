@@ -113,44 +113,70 @@ class Pi0(_model.BaseModel):
     def embed_prefix(
         self, obs: _model.Observation
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
-        input_mask = []
-        ar_mask = []
-        tokens = []
-        # embed images
-        for name in obs.images:
-            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+        # Build tokens for each modality separately
+        image_tokens_list = []
+        image_mask_list = []
+        image_seq_len = 0
 
-            tokens.append(image_tokens)
-            input_mask.append(
+        text_tokens = None
+        text_mask = None
+        text_seq_len = 0
+
+        state_tokens = None
+        state_mask = None
+        state_seq_len = 0
+
+        # 1. Embed images
+        for name in obs.images:
+            img_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+            image_tokens_list.append(img_tokens)
+            image_mask_list.append(
                 einops.repeat(
                     obs.image_masks[name],
                     "b -> b s",
-                    s=image_tokens.shape[1],
+                    s=img_tokens.shape[1],
                 )
             )
-            # image tokens attend to each other
-            ar_mask += [False] * image_tokens.shape[1]
+            image_seq_len += img_tokens.shape[1]
 
-        # add language (aka tokenized inputs)
+        # 2. Embed text (language / tokenized inputs)
         if obs.tokenized_prompt is not None:
-            tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
-            tokens.append(tokenized_inputs)
-            input_mask.append(obs.tokenized_prompt_mask)
-            # full attention between image and language inputs
-            ar_mask += [False] * tokenized_inputs.shape[1]
+            text_tokens = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
+            text_mask = obs.tokenized_prompt_mask
+            text_seq_len = text_tokens.shape[1]
 
-        # NEW: Add state history tokens to prefix
+        # 3. Embed state history
         if self.use_state_history and obs.state_history is not None:
             # obs.state_history shape: [b, history_len, state_dim]
             b, h, d = obs.state_history.shape
             state_flat = obs.state_history.reshape(b * h, d)
             state_tokens_flat = self.state_history_proj(state_flat)
             state_tokens = state_tokens_flat.reshape(b, h, -1)
+            state_mask = jnp.ones((b, h), dtype=jnp.bool_)
+            state_seq_len = h
 
+        # 4. Concatenate in order: [state, image, text]
+        # This ordering places proprioceptive state first, aligning with
+        # "self before world" cognitive flow: know own state, then observe
+        # environment, then receive instructions.
+        tokens = []
+        input_mask = []
+        ar_mask = []
+
+        if state_tokens is not None:
             tokens.append(state_tokens)
-            input_mask.append(jnp.ones((b, h), dtype=jnp.bool_))
-            # Bidirectional attention within prefix
-            ar_mask += [False] * h
+            input_mask.append(state_mask)
+            ar_mask += [False] * state_seq_len
+
+        if image_tokens_list:
+            tokens.append(jnp.concatenate(image_tokens_list, axis=1))
+            input_mask.append(jnp.concatenate(image_mask_list, axis=1))
+            ar_mask += [False] * image_seq_len
+
+        if text_tokens is not None:
+            tokens.append(text_tokens)
+            input_mask.append(text_mask)
+            ar_mask += [False] * text_seq_len
 
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
