@@ -128,9 +128,20 @@ class FakeDataset(Dataset):
 
 
 def create_torch_dataset(
-    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    subgoal_interval: int | None,
+    model_config: _model.BaseModelConfig,
 ) -> Dataset:
-    """Create a dataset for training."""
+    """Create a dataset for training.
+
+    Args:
+        data_config: Data configuration.
+        action_horizon: Number of future action steps to fetch.
+        subgoal_interval: How far ahead to fetch future states for subgoal prediction (in timesteps).
+            Only used for Pi0-Subgoal model. Pass None if not using subgoals.
+        model_config: Model configuration.
+    """
     repo_id = data_config.repo_id
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
@@ -138,11 +149,20 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+
+    # Build delta_timestamps for action sequences
+    delta_timestamps = {
+        key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+    }
+
+    # Add future state sequences for subgoal prediction if configured
+    if data_config.state_sequence_keys is not None and subgoal_interval is not None:
+        for key in data_config.state_sequence_keys:
+            delta_timestamps[key] = [t / dataset_meta.fps for t in range(subgoal_interval)]
+
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
+        delta_timestamps=delta_timestamps,
     )
 
     if data_config.prompt_from_task:
@@ -253,10 +273,14 @@ def create_data_loader(
             skip_norm_stats=skip_norm_stats,
             framework=framework,
         )
+    # Get subgoal_interval from model config if it's a Pi0Subgoal model
+    subgoal_interval = getattr(config.model, "subgoal_interval", None)
+
     return create_torch_data_loader(
         data_config,
         model_config=config.model,
         action_horizon=config.model.action_horizon,
+        subgoal_interval=subgoal_interval,
         batch_size=config.batch_size,
         sharding=sharding,
         shuffle=shuffle,
@@ -272,6 +296,7 @@ def create_torch_data_loader(
     data_config: _config.DataConfig,
     model_config: _model.BaseModelConfig,
     action_horizon: int,
+    subgoal_interval: int | None,
     batch_size: int,
     *,
     sharding: jax.sharding.Sharding | None = None,
@@ -287,6 +312,8 @@ def create_torch_data_loader(
     Args:
         data_config: The data configuration.
         action_horizon: The action horizon.
+        subgoal_interval: How far ahead to fetch future states for subgoal prediction (in timesteps).
+            Only used for Pi0-Subgoal model. Pass None if not using subgoals.
         batch_size: The batch size.
         sharding: The sharding to use for the data loader. If None, the data loader will
             use a single device sharding.
@@ -299,7 +326,7 @@ def create_torch_data_loader(
             execute in the main process.
         seed: The seed to use for shuffling the data.
     """
-    dataset = create_torch_dataset(data_config, action_horizon, model_config)
+    dataset = create_torch_dataset(data_config, action_horizon, subgoal_interval, model_config)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     # Use TorchDataLoader for both frameworks

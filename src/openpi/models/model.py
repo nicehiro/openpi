@@ -33,6 +33,7 @@ class ModelType(enum.Enum):
     PI0 = "pi0"
     PI0_FAST = "pi0_fast"
     PI05 = "pi05"
+    PI0_SUBGOAL = "pi0_subgoal"
 
 
 # The model always expects these images
@@ -106,6 +107,12 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # pi0-subgoal model specific fields.
+
+    # Subgoal trace: sequence of future proprio states for subgoal prediction.
+    # Shape: [*batch, subgoal_length, action_dim]
+    subgoal_trace: at.Float[ArrayT, "*b sl ad"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -126,6 +133,7 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            subgoal_trace=data.get("subgoal_trace"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:

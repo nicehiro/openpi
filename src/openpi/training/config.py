@@ -16,6 +16,7 @@ import tyro
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
+import openpi.models.pi0_subgoal as pi0_subgoal
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.calvin_policy as calvin_policy
@@ -86,6 +87,10 @@ class DataConfig:
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
     # LeRobot dataset is using different keys to represent the action.
     action_sequence_keys: Sequence[str] = ("actions",)
+
+    # Names of keys that will be used by the data loader to generate future state sequences for subgoal
+    # prediction. Only used for Pi0-Subgoal model. The length is defined by `subgoal_interval` in model config.
+    state_sequence_keys: Sequence[str] | None = None
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
@@ -159,6 +164,22 @@ class ModelTransformFactory(GroupFactory):
                             action_horizon=model_config.action_horizon,
                             action_dim=model_config.action_dim,
                         )
+                    ],
+                )
+            case _model.ModelType.PI0_SUBGOAL:
+                assert isinstance(model_config, pi0_subgoal.Pi0SubgoalConfig)
+                return _transforms.Group(
+                    inputs=[
+                        _transforms.InjectDefaultPrompt(self.default_prompt),
+                        _transforms.ResizeImages(224, 224),
+                        _transforms.TokenizePrompt(
+                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                        ),
+                        _transforms.PadStatesAndActions(model_config.action_dim),
+                        _transforms.ExtractSubgoalTrace(
+                            subgoal_horizon=model_config.subgoal_horizon,
+                            future_state_key="future_states",
+                        ),
                     ],
                 )
 
@@ -356,6 +377,57 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotLiberoSubgoalDataConfig(DataConfigFactory):
+    """Data config for Pi0-Subgoal model with LIBERO dataset.
+
+    Extends the standard LIBERO data config to also request future states
+    for subgoal prediction.
+    """
+
+    extra_delta_transform: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Repack transform includes future_states for subgoal prediction
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                        "future_states": "observation/state",  # Will be a sequence from delta_timestamps
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
+            outputs=[libero_policy.LiberoOutputs()],
+        )
+
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            state_sequence_keys=("observation/state",),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotCalvinDataConfig(DataConfigFactory):
     """Data config for CALVIN datasets stored in LeRobot v2 format."""
 
@@ -401,6 +473,60 @@ class LeRobotCalvinDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
             prompt_from_task=self.prompt_from_task,
             action_sequence_keys=("action",),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotCalvinSubgoalDataConfig(DataConfigFactory):
+    """Data config for Pi0-Subgoal model with CALVIN dataset.
+
+    Extends the standard CALVIN data config to also request future states
+    for subgoal prediction.
+    """
+
+    extra_delta_transform: bool = False
+    prompt_from_task: bool = True
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Repack transform includes future_states for subgoal prediction
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.top",
+                        "observation/wrist_image": "observation.images.wrist",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                        "future_states": "observation/state",  # Will be a sequence from delta_timestamps
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[calvin_policy.CalvinInputs(model_type=model_config.model_type)],
+            outputs=[calvin_policy.CalvinOutputs()],
+        )
+
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            prompt_from_task=self.prompt_from_task,
+            action_sequence_keys=("action",),
+            state_sequence_keys=("observation/state",),
         )
 
 
@@ -998,6 +1124,49 @@ _CONFIGS = [
             ),
         ),
         # Update this path if you have a local pi0_base; otherwise it will attempt to download from GCS.
+        weight_loader=weight_loaders.CheckpointWeightLoader("/model/fywang/pi0_base/params"),
+        num_train_steps=100_000,
+        checkpoint_base_dir="/data/fywang/pi-calvin/checkpoints/",
+        num_workers=2,
+        batch_size=32,
+        save_interval=5000,
+        keep_period=10000,
+    ),
+    #
+    # Pi0-Subgoal configs (for subgoal prediction experiments).
+    #
+    TrainConfig(
+        name="pi0_subgoal_libero",
+        model=pi0_subgoal.Pi0SubgoalConfig(
+            action_dim=7,
+            action_horizon=10,
+            subgoal_interval=20,
+            subgoal_horizon=5,
+        ),
+        data=LeRobotLiberoSubgoalDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi0_subgoal_calvin",
+        model=pi0_subgoal.Pi0SubgoalConfig(
+            action_dim=7,
+            action_horizon=10,
+            subgoal_interval=20,
+            subgoal_horizon=5,
+        ),
+        data=LeRobotCalvinSubgoalDataConfig(
+            repo_id="/data/fywang/Calvin/task_ABCD_D/lerobot_v2_dataset",
+            prompt_from_task=True,
+            assets=AssetsConfig(
+                assets_dir="./assets",
+                asset_id="calvin/task_ABCD_D",
+            ),
+        ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/model/fywang/pi0_base/params"),
         num_train_steps=100_000,
         checkpoint_base_dir="/data/fywang/pi-calvin/checkpoints/",

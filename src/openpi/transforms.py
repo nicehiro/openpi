@@ -337,6 +337,50 @@ class PadStatesAndActions(DataTransformFn):
         return data
 
 
+@dataclasses.dataclass(frozen=True)
+class ExtractSubgoalTrace(DataTransformFn):
+    """Extracts subgoal trace from future states in the trajectory.
+
+    This transform creates a downsampled sequence of future proprio states
+    to serve as subgoals for the Pi0-Subgoal model.
+
+    The subgoal trace is extracted by sampling states at regular intervals
+    from the future state sequence provided by the dataset.
+
+    Args:
+        subgoal_horizon: Number of subgoal waypoints to extract (like action_horizon).
+        future_state_key: Key in data dict containing future states sequence.
+            This should be populated by the data loader via delta_timestamps.
+    """
+
+    subgoal_horizon: int
+    future_state_key: str = "future_states"
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if self.future_state_key not in data:
+            # During inference or if future states not available,
+            # subgoal_trace will be predicted by the model
+            return data
+
+        future_states = np.asarray(data[self.future_state_key])  # [subgoal_interval, state_dim]
+        interval = future_states.shape[0]
+
+        # Calculate sampling indices for subgoals
+        # We want subgoal_horizon waypoints evenly spread over the interval
+        if self.subgoal_horizon == 1:
+            indices = [interval - 1]
+        else:
+            # Evenly spaced indices to get future waypoints
+            indices = np.linspace(0, interval - 1, self.subgoal_horizon, dtype=int)
+
+        # Sample subgoal waypoints - keep original state_dim, no padding
+        subgoal_trace = future_states[indices]  # [subgoal_horizon, state_dim]
+
+        data["subgoal_trace"] = subgoal_trace
+
+        return data
+
+
 def flatten_dict(tree: at.PyTree) -> dict:
     """Flatten a nested dictionary. Uses '/' as the separator."""
     return traverse_util.flatten_dict(tree, sep="/")
