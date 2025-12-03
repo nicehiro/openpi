@@ -1105,6 +1105,13 @@ _CONFIGS = [
         ),
         num_train_steps=100_000,
         wandb_enabled=False,
+        num_train_steps=100_000,
+        checkpoint_base_dir="/output/checkpoints/",
+        num_workers=32,
+        batch_size=32,
+        save_interval=10000,
+        keep_period=20000,
+        wandb_enabled=False,
     ),
     #
     # RoboArena configs.
