@@ -73,6 +73,17 @@ class PaliGemmaWeightLoader(WeightLoader):
         return _merge_params(loaded_params, params, missing_regex=".*")
 
 
+@dataclasses.dataclass(frozen=True)
+class Pi0SubgoalWeightLoader(WeightLoader):
+    """Loads weights from a Pi0 base checkpoint for Pi0-Subgoal model.
+    """
+    params_path: str
+
+    def load(self, params: at.Params) -> at.Params:
+        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+        return _merge_params(loaded_params, params, missing_regex=".*(subgoal|action_state_proj|action_subgoal_proj|_2|lora).*")
+
+
 def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex: str) -> at.Params:
     """Merges the loaded parameters with the reference parameters.
 

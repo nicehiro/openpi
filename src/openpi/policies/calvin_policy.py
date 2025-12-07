@@ -26,8 +26,14 @@ class CalvinInputs(transforms.DataTransformFn):
         base_image = _parse_image(data["observation/image"])
         wrist_image = _parse_image(data["observation/wrist_image"])
 
+        # Handle state - may be a sequence (for subgoal training) or single state (for inference)
+        state = np.asarray(data["observation/state"])
+        if state.ndim == 2:
+            # State is a sequence from delta_timestamps, take first element (current state)
+            state = state[0]
+
         inputs = {
-            "state": data["observation/state"],
+            "state": state,
             "image": {
                 "base_0_rgb": base_image,
                 "left_wrist_0_rgb": wrist_image,
@@ -45,6 +51,10 @@ class CalvinInputs(transforms.DataTransformFn):
 
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
+
+        # Pass through future_states for subgoal training
+        if "future_states" in data:
+            inputs["future_states"] = data["future_states"]
 
         return inputs
 

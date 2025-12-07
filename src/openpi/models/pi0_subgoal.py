@@ -58,6 +58,18 @@ class Pi0SubgoalConfig(_model.BaseModelConfig):
     subgoal_num_steps: int = 10  # Denoising steps for subgoal generation
     action_num_steps: int = 10  # Denoising steps for action generation
 
+    # Training stage: "subgoal", "action", or "both"
+    # - "subgoal": Only train subgoal expert (stage 1)
+    # - "action": Only train action expert (stage 2)
+    # - "both": Train both simultaneously (original behavior, high memory)
+    training_stage: str = "both"
+
+    # Whether to use predicted subgoals (from frozen subgoal expert) or ground-truth
+    # Only applies when training_stage="action"
+    # - False: Use ground-truth subgoal_trace from dataset (teacher forcing)
+    # - True: Generate subgoals from frozen subgoal expert first
+    use_predicted_subgoals: bool = False
+
     @property
     @override
     def model_type(self) -> _model.ModelType:
@@ -183,7 +195,7 @@ class Pi0Subgoal(_model.BaseModel):
         # Subgoal module projections
         self.subgoal_state_proj = nnx.Linear(config.action_dim, subgoal_expert_config.width, rngs=rngs)
         self.subgoal_in_proj = nnx.Linear(config.action_dim, subgoal_expert_config.width, rngs=rngs)
-        self.subgoal_time_mlp_in = nnx.Linear(subgoal_expert_config.width, subgoal_expert_config.width, rngs=rngs)
+        self.subgoal_time_mlp_in = nnx.Linear(2 * subgoal_expert_config.width, subgoal_expert_config.width, rngs=rngs)
         self.subgoal_time_mlp_out = nnx.Linear(subgoal_expert_config.width, subgoal_expert_config.width, rngs=rngs)
         self.subgoal_out_proj = nnx.Linear(subgoal_expert_config.width, config.action_dim, rngs=rngs)
 
@@ -191,7 +203,7 @@ class Pi0Subgoal(_model.BaseModel):
         self.action_state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         self.action_subgoal_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
-        self.action_time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+        self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
@@ -272,15 +284,14 @@ class Pi0Subgoal(_model.BaseModel):
         # Project noisy subgoals
         subgoal_tokens = self.subgoal_in_proj(noisy_subgoals)  # [b, sl, emb]
 
-        # Embed timestep using sine-cosine positional encoding
+        # Embed timestep and mix with subgoal tokens (same pattern as action module)
         time_emb = posemb_sincos(timestep, self.subgoal_in_proj.out_features, min_period=4e-3, max_period=4.0)
-        time_emb = self.subgoal_time_mlp_in(time_emb)
-        time_emb = nnx.swish(time_emb)
-        time_emb = self.subgoal_time_mlp_out(time_emb)
-        time_emb = nnx.swish(time_emb)
-
-        # Add time embedding to subgoal tokens
-        subgoal_tokens = subgoal_tokens + time_emb[:, None, :]
+        time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.subgoal_horizon)
+        subgoal_time_tokens = jnp.concatenate([subgoal_tokens, time_tokens], axis=-1)
+        subgoal_time_tokens = self.subgoal_time_mlp_in(subgoal_time_tokens)
+        subgoal_time_tokens = nnx.swish(subgoal_time_tokens)
+        subgoal_time_tokens = self.subgoal_time_mlp_out(subgoal_time_tokens)
+        subgoal_tokens = subgoal_time_tokens
 
         # Concatenate: [current_state, subgoal_trace]
         tokens = jnp.concatenate([state_token, subgoal_tokens], axis=1)
@@ -330,15 +341,14 @@ class Pi0Subgoal(_model.BaseModel):
         # Project noisy actions
         action_tokens = self.action_in_proj(noisy_actions)  # [b, ah, emb]
 
-        # Embed timestep
+        # Embed timestep and mix with action tokens (same as Pi0)
         time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
-        time_emb = self.action_time_mlp_in(time_emb)
-        time_emb = nnx.swish(time_emb)
-        time_emb = self.action_time_mlp_out(time_emb)
-        time_emb = nnx.swish(time_emb)
-
-        # Add time embedding to action tokens only
-        action_tokens = action_tokens + time_emb[:, None, :]
+        time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
+        action_time_tokens = jnp.concatenate([action_tokens, time_tokens], axis=-1)
+        action_time_tokens = self.action_time_mlp_in(action_time_tokens)
+        action_time_tokens = nnx.swish(action_time_tokens)
+        action_time_tokens = self.action_time_mlp_out(action_time_tokens)
+        action_tokens = action_time_tokens
 
         # Concatenate: [current_state, subgoal_trace, actions]
         # This forms the "infix + suffix" for the action expert
@@ -362,83 +372,258 @@ class Pi0Subgoal(_model.BaseModel):
 
     @override
     def compute_loss(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        subgoal_trace: at.Array | None = None,
+        *,
+        train: bool = False,
     ) -> at.Float[at.Array, "*b ah"]:
-        """Compute combined loss for subgoal and action prediction.
+        """Compute loss for subgoal and/or action prediction.
 
-        Note: This method expects `observation` to contain a `subgoal_trace` field
-        with the ground-truth subgoal trace.
+        Args:
+            rng: Random key for noise generation.
+            observation: Model observation inputs.
+            actions: Ground-truth action sequence.
+            subgoal_trace: Ground-truth subgoal trace (future proprio states).
+            train: Whether in training mode.
+
+        The training_stage config determines which loss is computed:
+        - "subgoal": Only subgoal flow matching loss (stage 1)
+        - "action": Only action flow matching loss (stage 2), with subgoal as input
+        - "both": Combined loss (original behavior, high memory)
         """
-        preprocess_rng, subgoal_noise_rng, subgoal_time_rng, action_noise_rng, action_time_rng = jax.random.split(
-            rng, 5
+        if subgoal_trace is None:
+            raise ValueError("subgoal_trace must be provided for training Pi0-Subgoal model")
+
+        training_stage = self.config.training_stage
+
+        preprocess_rng, subgoal_noise_rng, subgoal_time_rng, action_noise_rng, action_time_rng, predict_rng = (
+            jax.random.split(rng, 6)
         )
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
-        # Get subgoal trace from observation (must be added by data transform)
-        # For now, assume it's passed via a custom field or we extract from future states
-        # TODO: Add subgoal_trace to Observation or pass separately
-        subgoal_trace = observation.subgoal_trace  # [b, sl, ad]
-
         batch_shape = actions.shape[:-2]
 
-        # === Subgoal Flow Matching ===
+        # === Stage 1: Subgoal Expert Training Only ===
+        if training_stage == "subgoal":
+            return self._compute_subgoal_loss(
+                observation, subgoal_trace, subgoal_noise_rng, subgoal_time_rng, batch_shape
+            )
+
+        # === Stage 2: Action Expert Training Only ===
+        if training_stage == "action":
+            # Determine which subgoals to use for conditioning
+            if self.config.use_predicted_subgoals:
+                # Generate subgoals from subgoal expert
+                # No stop_gradient: action loss will also update subgoal expert (end-to-end finetuning)
+                subgoal_for_action = self._predict_subgoals(observation, predict_rng)
+            else:
+                # Use ground-truth subgoals (teacher forcing)
+                subgoal_for_action = subgoal_trace
+
+            return self._compute_action_loss(
+                observation, actions, subgoal_for_action, action_noise_rng, action_time_rng, batch_shape
+            )
+
+        # === Both: Original behavior (high memory) ===
+        return self._compute_combined_loss(
+            observation,
+            actions,
+            subgoal_trace,
+            subgoal_noise_rng,
+            subgoal_time_rng,
+            action_noise_rng,
+            action_time_rng,
+            batch_shape,
+        )
+
+    def _predict_subgoals(
+        self,
+        observation: _model.Observation,
+        rng: at.KeyArrayLike,
+    ) -> at.Float[at.Array, "b sl ad"]:
+        """Predict subgoals using the subgoal expert (for action training with predicted subgoals)."""
+        batch_size = observation.state.shape[0]
+
+        # Embed prefix and cache KV
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        _, prefix_kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None, None], mask=prefix_attn_mask, positions=positions
+        )
+
+        # Generate subgoals via flow matching
+        subgoal_dt = -1.0 / self.config.subgoal_num_steps
+        subgoal_noise = jax.random.normal(rng, (batch_size, self.subgoal_horizon, self.action_dim))
+
+        def subgoal_step(carry):
+            subgoals, time = carry
+
+            infix_tokens, infix_mask, infix_ar_mask = self.embed_infix(
+                observation, subgoals, jnp.broadcast_to(time, batch_size)
+            )
+
+            infix_attn_mask = make_attn_mask(infix_mask, infix_ar_mask)
+            prefix_attn_mask_for_infix = einops.repeat(prefix_mask, "b p -> b s p", s=infix_tokens.shape[1])
+            full_attn_mask = jnp.concatenate([prefix_attn_mask_for_infix, infix_attn_mask], axis=-1)
+
+            infix_positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(infix_mask, axis=-1) - 1
+
+            (_, infix_out, _), _ = self.PaliGemma.llm(
+                [None, infix_tokens, None],
+                mask=full_attn_mask,
+                positions=infix_positions,
+                kv_cache=prefix_kv_cache,
+            )
+
+            v_t = self.subgoal_out_proj(infix_out[:, 1:])
+            return subgoals + subgoal_dt * v_t, time + subgoal_dt
+
+        def subgoal_cond(carry):
+            _, time = carry
+            return time >= -subgoal_dt / 2
+
+        predicted_subgoals, _ = jax.lax.while_loop(subgoal_cond, subgoal_step, (subgoal_noise, 1.0))
+        return predicted_subgoals
+
+    def _compute_subgoal_loss(
+        self,
+        observation: _model.Observation,
+        subgoal_trace: at.Array,
+        subgoal_noise_rng: at.KeyArrayLike,
+        subgoal_time_rng: at.KeyArrayLike,
+        batch_shape: tuple,
+    ) -> at.Float[at.Array, "*b ah"]:
+        """Compute subgoal loss only (Stage 1 training)."""
+        # Subgoal Flow Matching Setup
         subgoal_noise = jax.random.normal(subgoal_noise_rng, subgoal_trace.shape)
         subgoal_time = jax.random.beta(subgoal_time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
         subgoal_time_expanded = subgoal_time[..., None, None]
         subgoal_x_t = subgoal_time_expanded * subgoal_noise + (1 - subgoal_time_expanded) * subgoal_trace
         subgoal_u_t = subgoal_noise - subgoal_trace
 
-        # Embed prefix
+        # Embed prefix + infix only (no suffix)
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-
-        # Embed infix for subgoal prediction
         infix_tokens, infix_mask, infix_ar_mask = self.embed_infix(observation, subgoal_x_t, subgoal_time)
 
-        # Combined attention mask for prefix + infix
+        # Attention mask for prefix + infix
         input_mask = jnp.concatenate([prefix_mask, infix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, infix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
         positions = jnp.cumsum(input_mask, axis=1) - 1
 
-        # Forward pass: prefix (expert 0) + infix (expert 1)
+        # Forward pass: prefix (expert 0) + infix (expert 1), no suffix
         (prefix_out, infix_out, _), _ = self.PaliGemma.llm(
             [prefix_tokens, infix_tokens, None], mask=attn_mask, positions=positions
         )
 
-        # Extract subgoal predictions (skip state token)
+        # Subgoal predictions (skip state token in infix)
         subgoal_v_t = self.subgoal_out_proj(infix_out[:, 1:])  # [b, sl, ad]
         subgoal_loss = jnp.mean(jnp.square(subgoal_v_t - subgoal_u_t), axis=-1)  # [b, sl]
 
-        # === Action Flow Matching ===
+        # Broadcast to action_horizon shape for compatibility with training loop
+        subgoal_loss_mean = jnp.mean(subgoal_loss, axis=-1, keepdims=True)  # [b, 1]
+        return jnp.broadcast_to(subgoal_loss_mean, (*batch_shape, self.action_horizon))  # [b, ah]
+
+    def _compute_action_loss(
+        self,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        subgoal_for_action: at.Array,
+        action_noise_rng: at.KeyArrayLike,
+        action_time_rng: at.KeyArrayLike,
+        batch_shape: tuple,
+    ) -> at.Float[at.Array, "*b ah"]:
+        """Compute action loss only (Stage 2 training).
+
+        Args:
+            subgoal_for_action: Subgoals to condition action generation on.
+                Can be ground-truth or predicted from frozen subgoal expert.
+        """
+        # Action Flow Matching Setup
         action_noise = jax.random.normal(action_noise_rng, actions.shape)
         action_time = jax.random.beta(action_time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
         action_time_expanded = action_time[..., None, None]
         action_x_t = action_time_expanded * action_noise + (1 - action_time_expanded) * actions
         action_u_t = action_noise - actions
 
-        # Embed suffix for action prediction (using ground-truth subgoals)
+        # Embed prefix + suffix (suffix includes subgoal conditioning)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(
-            observation, subgoal_trace, action_x_t, action_time
+            observation, subgoal_for_action, action_x_t, action_time
         )
 
-        # Combined attention mask for prefix + suffix (suffix includes infix context)
+        # Attention mask for prefix + suffix
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
         positions = jnp.cumsum(input_mask, axis=1) - 1
 
-        # Forward pass: prefix (expert 0) + suffix with infix (expert 2)
+        # Forward pass: prefix (expert 0) + suffix (expert 2), no infix
         (prefix_out, _, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, None, suffix_tokens], mask=attn_mask, positions=positions
         )
 
-        # Extract action predictions (skip state + subgoal tokens)
+        # Action predictions (skip state + subgoal tokens in suffix)
+        action_v_t = self.action_out_proj(suffix_out[:, 1 + self.subgoal_horizon :])  # [b, ah, ad]
+        return jnp.mean(jnp.square(action_v_t - action_u_t), axis=-1)  # [b, ah]
+
+    def _compute_combined_loss(
+        self,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        subgoal_trace: at.Array,
+        subgoal_noise_rng: at.KeyArrayLike,
+        subgoal_time_rng: at.KeyArrayLike,
+        action_noise_rng: at.KeyArrayLike,
+        action_time_rng: at.KeyArrayLike,
+        batch_shape: tuple,
+    ) -> at.Float[at.Array, "*b ah"]:
+        """Compute combined subgoal + action loss (original behavior, high memory)."""
+        # Subgoal Flow Matching Setup
+        subgoal_noise = jax.random.normal(subgoal_noise_rng, subgoal_trace.shape)
+        subgoal_time = jax.random.beta(subgoal_time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
+        subgoal_time_expanded = subgoal_time[..., None, None]
+        subgoal_x_t = subgoal_time_expanded * subgoal_noise + (1 - subgoal_time_expanded) * subgoal_trace
+        subgoal_u_t = subgoal_noise - subgoal_trace
+
+        # Action Flow Matching Setup
+        action_noise = jax.random.normal(action_noise_rng, actions.shape)
+        action_time = jax.random.beta(action_time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
+        action_time_expanded = action_time[..., None, None]
+        action_x_t = action_time_expanded * action_noise + (1 - action_time_expanded) * actions
+        action_u_t = action_noise - actions
+
+        # Embed all three parts
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        infix_tokens, infix_mask, infix_ar_mask = self.embed_infix(observation, subgoal_x_t, subgoal_time)
+        suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(
+            observation, subgoal_trace, action_x_t, action_time
+        )
+
+        # Combined attention mask for prefix + infix + suffix
+        input_mask = jnp.concatenate([prefix_mask, infix_mask, suffix_mask], axis=1)
+        ar_mask = jnp.concatenate([prefix_ar_mask, infix_ar_mask, suffix_ar_mask], axis=0)
+        attn_mask = make_attn_mask(input_mask, ar_mask)
+        positions = jnp.cumsum(input_mask, axis=1) - 1
+
+        # Single forward pass: prefix (expert 0) + infix (expert 1) + suffix (expert 2)
+        (prefix_out, infix_out, suffix_out), _ = self.PaliGemma.llm(
+            [prefix_tokens, infix_tokens, suffix_tokens], mask=attn_mask, positions=positions
+        )
+
+        # Subgoal predictions (skip state token in infix)
+        subgoal_v_t = self.subgoal_out_proj(infix_out[:, 1:])  # [b, sl, ad]
+        subgoal_loss = jnp.mean(jnp.square(subgoal_v_t - subgoal_u_t), axis=-1)  # [b, sl]
+
+        # Action predictions (skip state + subgoal tokens in suffix)
         action_v_t = self.action_out_proj(suffix_out[:, 1 + self.subgoal_horizon :])  # [b, ah, ad]
         action_loss = jnp.mean(jnp.square(action_v_t - action_u_t), axis=-1)  # [b, ah]
 
         # Combined loss: L = L_subgoal + lambda * L_action
-        # Return action_loss shape for compatibility with training loop
-        # Average subgoal loss over subgoal_horizon and broadcast to action_horizon
         subgoal_loss_mean = jnp.mean(subgoal_loss, axis=-1, keepdims=True)  # [b, 1]
         subgoal_loss_broadcast = jnp.broadcast_to(subgoal_loss_mean, action_loss.shape)  # [b, ah]
 

@@ -175,11 +175,13 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                         ),
-                        _transforms.PadStatesAndActions(model_config.action_dim),
+                        # ExtractSubgoalTrace must run before PadStatesAndActions
+                        # so that subgoal_trace exists when padding is applied
                         _transforms.ExtractSubgoalTrace(
                             subgoal_horizon=model_config.subgoal_horizon,
                             future_state_key="future_states",
                         ),
+                        _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
                 )
 
@@ -499,7 +501,7 @@ class LeRobotCalvinSubgoalDataConfig(DataConfigFactory):
                         "observation/state": "observation.state",
                         "actions": "action",
                         "prompt": "prompt",
-                        "future_states": "observation/state",  # Will be a sequence from delta_timestamps
+                        "future_states": "observation.state",  # Will be a sequence from delta_timestamps
                     }
                 )
             ]
@@ -526,7 +528,7 @@ class LeRobotCalvinSubgoalDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
             prompt_from_task=self.prompt_from_task,
             action_sequence_keys=("action",),
-            state_sequence_keys=("observation/state",),
+            state_sequence_keys=("observation.state",),
         )
 
 
@@ -1154,26 +1156,135 @@ _CONFIGS = [
     TrainConfig(
         name="pi0_subgoal_calvin",
         model=pi0_subgoal.Pi0SubgoalConfig(
-            action_dim=7,
             action_horizon=10,
-            subgoal_interval=20,
+            subgoal_interval=30,
             subgoal_horizon=5,
         ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=200_000,
+            decay_lr=5e-6,
+        ),
         data=LeRobotCalvinSubgoalDataConfig(
-            repo_id="/data/fywang/Calvin/task_ABCD_D/lerobot_v2_dataset",
+            repo_id="/data/fywang/Calvin/calvin_debug_dataset/lerobot_v2_dataset",
             prompt_from_task=True,
             assets=AssetsConfig(
                 assets_dir="./assets",
                 asset_id="calvin/task_ABCD_D",
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("/model/fywang/pi0_base/params"),
+        weight_loader=weight_loaders.Pi0SubgoalWeightLoader("/data/fywang/pi0_base/pi0_base/params"),
         num_train_steps=100_000,
-        checkpoint_base_dir="/data/fywang/pi-calvin/checkpoints/",
-        num_workers=2,
+        checkpoint_base_dir="/output/pi-calvin/checkpoints/",
+        num_workers=16,
         batch_size=32,
-        save_interval=5000,
-        keep_period=10000,
+        save_interval=10_000,
+        keep_period=20_000,
+        wandb_enabled=False,
+    ),
+    # Stage 1: Train subgoal expert only
+    # Only subgoal loss is computed, so only subgoal expert gets gradients (no freeze_filter needed)
+    TrainConfig(
+        name="pi0_subgoal_calvin_stage1",
+        model=pi0_subgoal.Pi0SubgoalConfig(
+            action_horizon=10,
+            subgoal_interval=30,
+            subgoal_horizon=5,
+            training_stage="subgoal",
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=200_000,
+            decay_lr=5e-6,
+        ),
+        data=LeRobotCalvinSubgoalDataConfig(
+            repo_id="/data/fywang/Calvin/calvin_debug_dataset/lerobot_v2_dataset",
+            prompt_from_task=True,
+            assets=AssetsConfig(
+                assets_dir="./assets",
+                asset_id="calvin/task_ABCD_D",
+            ),
+        ),
+        weight_loader=weight_loaders.Pi0SubgoalWeightLoader("/data/fywang/pi0_base/pi0_base/params"),
+        num_train_steps=100_000,
+        checkpoint_base_dir="/output/pi-calvin/checkpoints/",
+        num_workers=4,
+        batch_size=32,
+        save_interval=10_000,
+        keep_period=20_000,
+        wandb_enabled=False,
+    ),
+    # Stage 2: Train action expert with ground-truth subgoals (teacher forcing)
+    # Only action loss is computed, so only action expert gets gradients
+    TrainConfig(
+        name="pi0_subgoal_calvin_stage2",
+        model=pi0_subgoal.Pi0SubgoalConfig(
+            action_horizon=10,
+            subgoal_interval=30,
+            subgoal_horizon=5,
+            training_stage="action",
+            use_predicted_subgoals=False,  # Use GT subgoals (teacher forcing)
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=200_000,
+            decay_lr=5e-6,
+        ),
+        data=LeRobotCalvinSubgoalDataConfig(
+            repo_id="/data/fywang/Calvin/calvin_debug_dataset/lerobot_v2_dataset",
+            prompt_from_task=True,
+            assets=AssetsConfig(
+                assets_dir="./assets",
+                asset_id="calvin/task_ABCD_D",
+            ),
+        ),
+        # Load stage1 checkpoint (update path after stage1 training)
+        weight_loader=weight_loaders.CheckpointWeightLoader("/output/pi-calvin/checkpoints/pi0_subgoal_calvin_stage1/<step>/params"),
+        num_train_steps=100_000,
+        checkpoint_base_dir="/output/pi-calvin/checkpoints/",
+        num_workers=4,
+        batch_size=32,
+        save_interval=10_000,
+        keep_period=20_000,
+        wandb_enabled=False,
+    ),
+    # Stage 2 variant: Train with predicted subgoals (end-to-end finetuning)
+    # Action loss updates both action and subgoal experts
+    TrainConfig(
+        name="pi0_subgoal_calvin_stage2_e2e",
+        model=pi0_subgoal.Pi0SubgoalConfig(
+            action_horizon=10,
+            subgoal_interval=30,
+            subgoal_horizon=5,
+            training_stage="action",
+            use_predicted_subgoals=True,  # Use predicted subgoals, gradients flow to subgoal expert
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=200_000,
+            decay_lr=5e-6,
+        ),
+        data=LeRobotCalvinSubgoalDataConfig(
+            repo_id="/data/fywang/Calvin/calvin_debug_dataset/lerobot_v2_dataset",
+            prompt_from_task=True,
+            assets=AssetsConfig(
+                assets_dir="./assets",
+                asset_id="calvin/task_ABCD_D",
+            ),
+        ),
+        # Load stage1 checkpoint (update path after stage1 training)
+        weight_loader=weight_loaders.CheckpointWeightLoader("/output/pi-calvin/checkpoints/pi0_subgoal_calvin_stage1/<step>/params"),
+        num_train_steps=100_000,
+        checkpoint_base_dir="/output/pi-calvin/checkpoints/",
+        num_workers=4,
+        batch_size=32,
+        save_interval=10_000,
+        keep_period=20_000,
+        wandb_enabled=False,
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
