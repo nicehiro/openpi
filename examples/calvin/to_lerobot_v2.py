@@ -43,6 +43,8 @@ class Args:
     chunk_size: int = 100
     """Number of episodes to process in each parallel batch (controls memory usage)."""
 
+    num_workers: int = 8
+    """Number of parallel workers used to load CALVIN episodes."""
 
 def process_episode(
     episode: tuple,
@@ -70,15 +72,16 @@ def process_episode(
         if not step_file.exists():
             raise FileNotFoundError(f"Invalid data path: {step_file}")
 
-        total_data = np.load(step_file)
-        rgb_static = total_data["rgb_static"]  # uint8
-        rgb_gripper = total_data["rgb_gripper"]  # uint8
-        robot_obs = total_data["robot_obs"]  # float64
+        with np.load(step_file) as total_data:
+            rgb_static = total_data["rgb_static"]  # uint8
+            rgb_gripper = total_data["rgb_gripper"]  # uint8
+            robot_obs = total_data["robot_obs"]  # float64
 
         # Get action from next step's rel_actions
         if step < index_range[1]:
             next_file = data_path / split / f"episode_{str(step + 1).zfill(7)}.npz"
-            actions = np.load(next_file)["rel_actions"]
+            with np.load(next_file) as next_data:
+                actions = next_data["rel_actions"]
         else:
             # For the last step, use zero action
             actions = np.zeros(7, dtype=np.float32)
@@ -93,6 +96,15 @@ def process_episode(
         })
 
     return frames
+
+
+def write_episode_to_dataset(dataset: LeRobotDataset, episode_frames: list[dict]) -> None:
+    """Write a single episode to the dataset and release intermediate buffers."""
+    for frame in episode_frames:
+        dataset.add_frame(frame)
+    dataset.save_episode()
+    # Drop the Arrow table we just appended to avoid holding the full dataset in RAM.
+    dataset.hf_dataset = dataset.create_hf_dataset()
 
 
 def build_lerobot_dataset(args: Args) -> LeRobotDataset:
@@ -170,19 +182,21 @@ def build_lerobot_dataset(args: Args) -> LeRobotDataset:
         if not args.debug:
             # Process in chunks to limit memory usage
             total_chunks = (len(episodes) + args.chunk_size - 1) // args.chunk_size
-            for chunk_idx, chunk_start in enumerate(range(0, len(episodes), args.chunk_size)):
-                chunk = episodes[chunk_start:chunk_start + args.chunk_size]
-                print(f"\nProcessing chunk {chunk_idx + 1}/{total_chunks} ({len(chunk)} episodes)...")
+            ctx = multiprocessing.get_context("spawn")
+            max_workers = max(1, min(args.num_workers, os.cpu_count() or 1))
+            print(f"Using {max_workers} worker processes")
+            with ctx.Pool(processes=max_workers) as pool:
+                for chunk_idx, chunk_start in enumerate(range(0, len(episodes), args.chunk_size)):
+                    chunk = episodes[chunk_start:chunk_start + args.chunk_size]
+                    print(f"\nProcessing chunk {chunk_idx + 1}/{total_chunks} ({len(chunk)} episodes)...")
 
-                # Extract episode data in parallel
-                with multiprocessing.Pool(processes=os.cpu_count()) as pool:
-                    chunk_results = pool.map(partial_process, chunk)
-
-                # Write chunk to dataset immediately (frees memory after each chunk)
-                for episode_frames in tqdm(chunk_results, desc="Writing episodes"):
-                    for frame in episode_frames:
-                        dataset.add_frame(frame)
-                    dataset.save_episode()
+                    episode_iterator = pool.imap(partial_process, chunk, chunksize=1)
+                    for episode_frames in tqdm(
+                        episode_iterator,
+                        total=len(chunk),
+                        desc=f"Writing chunk {chunk_idx + 1}/{total_chunks}",
+                    ):
+                        write_episode_to_dataset(dataset, episode_frames)
         else:
             # Debug mode: process only the last episode
             if lang_ann:
@@ -191,9 +205,7 @@ def build_lerobot_dataset(args: Args) -> LeRobotDataset:
                     (lang_ann[i], lang_task[i], lang_index[i])
                 )
                 if results:
-                    for frame in results:
-                        dataset.add_frame(frame)
-                    dataset.save_episode()
+                    write_episode_to_dataset(dataset, results)
             else:
                 print(f"Warning: No episodes found for split {split} in debug mode.")
 
